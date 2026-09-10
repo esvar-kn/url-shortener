@@ -1,22 +1,33 @@
 {
   "name": "url-shortener",
   "version": "1.0.0",
-  "description": "Standalone Express URL Shortener Service using Base62 Encoding",
+  "description": "Standalone Express URL Shortener Service using Base62 Encoding and Prisma",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
-    "test": "node tests/base62.test.js"
+    "test": "node tests/base62.test.js && node tests/api.test.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev"
   },
-  "keywords": ["url-shortener", "base62", "express"],
+  "keywords": [
+    "url-shortener",
+    "base62",
+    "express",
+    "prisma",
+    "postgres"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@prisma/client": "^6.4.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2"
   },
   "devDependencies": {
-    "nodemon": "^3.1.9"
+    "nodemon": "^3.1.9",
+    "prisma": "^6.4.1",
+    "supertest": "^7.0.0"
   }
 }

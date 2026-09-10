@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const urlRoutes = require('./routes/url.routes');
 const { encodeBase62 } = require('./utils/base62');
 
 const app = express();
@@ -21,5 +22,8 @@ app.get('/encode/:id', (req, res) => {
   const shortCode = encodeBase62(id);
   return res.status(200).json({ id, shortCode });
 });
+
+// Mount URL Shortener routes
+app.use('/', urlRoutes);
 
 module.exports = app;

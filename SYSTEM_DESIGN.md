@@ -205,13 +205,34 @@ Client ----> API Gateway ----> URL Shortening Service ----> DB (Storage)
 
 > [!IMPORTANT]
 > Based on **Read Calculation**, we have concluded that the system is **read-heavy**.  
-> **Pareto Principle (80/20 Rule):** $20\%$ of the URLs generate $80\%$ of the redirection traffic. Hence, caching $20\%$ of daily read volume is concluded.
+> **Pareto Principle (80/20 Rule):** 20% of the URLs generate 80% of the redirection traffic. Hence, caching 20% of daily read volume is concluded.
 
 * **Daily Read Volume:**  
   $$4000 \times 24 \times 60 \times 60 = 345,600,000 \approx \mathbf{345.6 \text{ Million Reads}}$$
 
-* **Cache Read Volume ($20\%$ of Daily Read Volume):**  
+* **Cache Read Volume (20% of Daily Read Volume):**  
   $$0.2 \times 345.6 \text{ Million} \approx \mathbf{69 \text{ Million Reads}}$$
 
 * **Cache Memory Required:**  
   $$69,000,000 \times 500 \text{ bytes} = 34,500,000,000 \text{ bytes} \approx \mathbf{35 \text{ GB RAM required}}$$
+
+
+---
+
+## 🗄️ Section 3: Data Layer Scaling Strategy
+
+### 1. Read Replicas vs. Sharding Priority
+Because the URL Shortener is heavily **read-heavy (100:1 Read-to-Write ratio)** with $\sim 4,000 \text{ read QPS}$ vs $\sim 40 \text{ write QPS}$, **Read Replicas and Redis Caching are deployed first** before implementing database sharding:
+* **Read Replicas:** Multiple asynchronous database read replicas offload read queries from the primary database, allowing read capacity to scale horizontally.
+* **Redis Caching:** Serves hot short codes from memory, satisfying $\sim 80\%$ of redirection requests and reducing direct database load.
+
+> [!NOTE]
+> **Replication Lag & Tradeoffs:**  
+> Asynchronous replication introduces slight **replication lag** (milliseconds). If a user creates a short link and immediately clicks it while hitting a lagging replica, it may briefly return `404 Not Found`. For a URL Shortener, this **eventual consistency** is a highly acceptable tradeoff because high availability and low latency are prioritized over immediate strict consistency.
+
+---
+
+### 2. Write Scaling & Database Sharding Plan
+When write traffic or total data volume exceeds the limits of a single primary node ($> 3\text{ TB}$):
+* **Shard Key:** `shortCode` (or `shortURL`). Sharding by `shortCode` guarantees that every `GET /:shortCode` redirect request routes deterministically to a single database shard, avoiding expensive cross-shard queries.
+* **Sharding Algorithm:** **Consistent Hashing (Hash-Based)**. Using consistent hashing on `shortCode` ensures uniform data distribution across physical database nodes and minimizes key movement when scaling the cluster up or down.
