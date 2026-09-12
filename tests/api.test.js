@@ -6,7 +6,7 @@ const { safeRedisDel, safeRedisGet, redis } = require('../src/db/redis');
 const { processClickEvents, stopWorker } = require('../src/workers/analyticsWorker');
 
 async function runApiTests() {
-  console.log('🧪 Running Express API, Redis Cache-Aside & Async Queue Integration Tests...\n');
+  console.log('🧪 Running Express API, Redis Cache-Aside, 404 Error Handling & Analytics Tests...\n');
 
   // Test 1: GET /health
   const healthRes = await request(app).get('/health');
@@ -20,85 +20,106 @@ async function runApiTests() {
   assert.strictEqual(encodeRes.body.shortCode, 'BA');
   console.log('✅ GET /encode/:id passed');
 
-  // Test 3: POST /api/shorten with missing payload
+  // Test 3: Input validation (missing payload & garbage input rejection)
   const emptyRes = await request(app).post('/api/shorten').send({});
   assert.strictEqual(emptyRes.status, 400, 'Missing longUrl payload should return 400');
-  console.log('✅ POST /api/shorten validation (missing payload) passed');
 
-  // Test 4: POST /api/shorten with invalid URL
   const invalidUrlRes = await request(app).post('/api/shorten').send({ longUrl: 'not-a-valid-url' });
   assert.strictEqual(invalidUrlRes.status, 400, 'Invalid URL format should return 400');
-  console.log('✅ POST /api/shorten validation (invalid URL) passed');
+  console.log('✅ POST /api/shorten input validation (reject garbage input) passed');
 
-  // Test 5: End-to-End Cache-Aside Redirect & Async Click Queue Test
-  console.log('\n🔄 Testing GET /:shortCode Redirect, Cache-Aside & Async Click Worker...');
+  // Test 4: 404 Error Handling for Non-Existent Short Codes (Clean 404, No Server Crash)
+  console.log('\n🛡️ Testing 404 Error Handling for Non-Existent Short Codes...');
+  const missingRedirectRes = await request(app).get('/nonexistent_code_999');
+  assert.strictEqual(missingRedirectRes.status, 404, 'Non-existent shortCode should return 404');
+  assert.strictEqual(missingRedirectRes.body.error, 'Short URL not found');
+  console.log('  1️⃣ GET /:shortCode non-existent short code clean 404 passed');
 
-  const testLongUrl = 'https://example.com/test-redirect-page';
+  const missingStatsRes = await request(app).get('/api/urls/nonexistent_code_999/stats');
+  assert.strictEqual(missingStatsRes.status, 404, 'Non-existent shortCode stats should return 404');
+  assert.strictEqual(missingStatsRes.body.error, 'Short URL not found');
+  console.log('  2️⃣ GET /api/urls/:shortCode/stats non-existent stats clean 404 passed');
+
+  // Test 5: Custom Alias Support & Uniqueness Check
+  console.log('\n🎨 Testing Custom Alias Support...');
+  const aliasPayload = {
+    longUrl: 'https://example.com/custom-alias-target',
+    customAlias: 'my-custom-link'
+  };
+
+  const createAliasRes = await request(app).post('/api/shorten').send(aliasPayload);
+  assert.strictEqual(createAliasRes.status, 201, 'Creating custom alias should return 201 Created');
+  assert.strictEqual(createAliasRes.body.shortCode, 'my-custom-link');
+  console.log('  1️⃣ Custom Alias creation passed');
+
+  // Duplicate Alias Collision check
+  const duplicateAliasRes = await request(app).post('/api/shorten').send(aliasPayload);
+  assert.strictEqual(duplicateAliasRes.status, 409, 'Duplicate custom alias should return 409 Conflict');
+  assert.strictEqual(duplicateAliasRes.body.error, 'Custom alias is already taken');
+  console.log('  2️⃣ Custom Alias uniqueness collision check passed');
+
+  // Test 6: End-to-End Full Flow (Create -> Redirect -> Worker Queue -> Click Count Increment -> Stats)
+  console.log('\n🔄 Testing End-to-End Full Flow (Create -> Redirect -> Redis Queue -> Async Worker -> Stats)...');
+
+  const testLongUrl = 'https://example.com/full-flow-test-page';
   
-  // 5a. Create short URL in DB
-  const createdRecord = await prisma.url.create({
-    data: {
-      longUrl: testLongUrl
-    }
-  });
+  // 6a. Create short URL via API
+  const createRes = await request(app).post('/api/shorten').send({ longUrl: testLongUrl });
+  assert.strictEqual(createRes.status, 201);
+  const testShortCode = createRes.body.shortCode;
+  console.log(`  1️⃣ Created Short URL code: '${testShortCode}' for '${testLongUrl}'`);
 
-  const { encodeBase62 } = require('../src/utils/base62');
-  const testShortCode = encodeBase62(createdRecord.id);
-
-  await prisma.url.update({
-    where: { id: createdRecord.id },
-    data: { shortCode: testShortCode }
-  });
-
-  // Clear Redis key and queue to simulate clean state
+  // Clear Redis cache key to test Cache Miss first
   await safeRedisDel(`url:${testShortCode}`);
   await safeRedisDel('click-events');
 
-  // 5b. First Request -> Cache MISS (Queries Postgres DB & populates Redis, pushes click event)
+  // 6b. Visit short URL -> Redirect 1 (Cache MISS, queues click event)
   const firstReq = await request(app).get(`/${testShortCode}`);
-  assert.strictEqual(firstReq.status, 302, 'First redirect request should return 302 Found');
-  assert.strictEqual(firstReq.headers.location, testLongUrl, 'Redirect Location should match longUrl');
-  assert.strictEqual(firstReq.headers['x-cache'], 'MISS', 'First request should be a Cache MISS');
-  console.log('  1️⃣ First request: Cache MISS -> Fetched from DB, cached in Redis & click event queued');
+  assert.strictEqual(firstReq.status, 302, 'Redirect 1 should return 302');
+  assert.strictEqual(firstReq.headers.location, testLongUrl);
+  assert.strictEqual(firstReq.headers['x-cache'], 'MISS');
+  console.log('  2️⃣ Redirect 1 (Cache MISS): Returns 302 redirect & queues click event');
 
-  // Verify key is now populated in Redis
-  const cachedVal = await safeRedisGet(`url:${testShortCode}`);
-  assert.strictEqual(cachedVal, testLongUrl, 'Redis key should store longUrl');
-
-  // 5c. Second Request -> Cache HIT (Served directly from Redis, pushes click event)
+  // 6c. Visit short URL -> Redirect 2 (Cache HIT, queues click event)
   const secondReq = await request(app).get(`/${testShortCode}`);
-  assert.strictEqual(secondReq.status, 302, 'Second redirect request should return 302 Found');
-  assert.strictEqual(secondReq.headers.location, testLongUrl, 'Redirect Location should match longUrl');
-  assert.strictEqual(secondReq.headers['x-cache'], 'HIT', 'Second request should be a Cache HIT');
-  console.log('  2️⃣ Second request: Cache HIT -> Served directly from Redis & click event queued');
+  assert.strictEqual(secondReq.status, 302, 'Redirect 2 should return 302');
+  assert.strictEqual(secondReq.headers.location, testLongUrl);
+  assert.strictEqual(secondReq.headers['x-cache'], 'HIT');
+  console.log('  3️⃣ Redirect 2 (Cache HIT): Returns 302 redirect from Redis & queues click event');
 
-  // 5d. Start worker temporarily to consume queued click events from Redis list
+  // 6d. Launch Analytics Worker to consume queued click events
   const workerPromise = processClickEvents();
-
-  // Give worker a moment to consume events and update DB
   await new Promise((resolve) => setTimeout(resolve, 800));
   stopWorker();
+  console.log('  4️⃣ Async Analytics Worker: Consumed queued click events & updated database');
 
-  // 5e. Verify clickCount in DB was updated by the worker to 2
-  const updatedRecordInDb = await prisma.url.findUnique({
-    where: { id: createdRecord.id }
-  });
-  assert.strictEqual(updatedRecordInDb.clickCount, 2, 'Click count in DB should be updated to 2 by async worker');
-  console.log('  3️⃣ Async Analytics Worker: Consumed events from Redis list & updated clickCount to 2 in Postgres DB');
+  // 6e. Fetch Analytics Endpoint (GET /api/urls/:shortCode/stats)
+  const statsRes = await request(app).get(`/api/urls/${testShortCode}/stats`);
+  assert.strictEqual(statsRes.status, 200);
+  assert.strictEqual(statsRes.body.shortCode, testShortCode);
+  assert.strictEqual(statsRes.body.longUrl, testLongUrl);
+  assert.strictEqual(statsRes.body.clickCount, 2, 'Click count should be incremented to 2');
+  assert.strictEqual(Array.isArray(statsRes.body.dailyBreakdown), true);
+  assert.strictEqual(statsRes.body.dailyBreakdown[0].clicks, 2);
+  console.log(`  5️⃣ Stats Endpoint Verified: Total Clicks = ${statsRes.body.clickCount}, Daily Breakdown = ${JSON.stringify(statsRes.body.dailyBreakdown)}`);
 
   // Clean up test data
-  await prisma.url.delete({ where: { id: createdRecord.id } }).catch(() => {});
+  await prisma.url.deleteMany({
+    where: {
+      shortCode: { in: ['my-custom-link', testShortCode] }
+    }
+  }).catch(() => {});
   await safeRedisDel(`url:${testShortCode}`);
+  await safeRedisDel('url:my-custom-link');
   await safeRedisDel('click-events');
 
-  console.log('\n🎉 All API, Redis Cache-Aside & Async Queue Integration Tests Passed Successfully!');
-  
-  // Close connection handles so process exits cleanly
+  console.log('\n🎉 All Full Flow & 404 Error Handling Tests Passed Successfully!');
+
   await prisma.$disconnect();
   redis.disconnect();
 }
 
 runApiTests().catch((err) => {
-  console.error('❌ API & Redis Integration Test Failed:', err);
+  console.error('❌ API Integration Test Failed:', err);
   process.exit(1);
 });

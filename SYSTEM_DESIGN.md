@@ -322,3 +322,42 @@ Client ----> GET /:shortCode ----> Express App ----> Return HTTP 302 Redirect
 > [!NOTE]
 > **Production Recommendation:**  
 > In enterprise production systems handling millions of events/sec, **Apache Kafka** or **RabbitMQ** is preferred for event replayability, multi-consumer fanout (e.g. real-time fraud detection, geolocation tracking, data warehouse ingestion), and backpressure protection. For this project's scale, a **Redis List queue** provides a zero-overhead, highly performant async substitute.
+
+---
+
+## 🚀 Section 6: Production Security & Railway Deployment Architecture
+
+### 1. Security & Production Hardening
+
+* **HTTP Security Headers (`helmet`):** Protects against XSS, clickjacking, and MIME sniffing with a strict Content Security Policy (CSP) tailored for external CDNs (Google Fonts, FontAwesome, Chart.js).
+* **Rate Limiting (`express-rate-limit`):** Protects write paths (`POST /api/shorten`) against spam and brute-force alias squatting by capping IP creations to `30 requests / 15 mins`.
+* **Centralized Operational Error Handling:** Standardized `AppError` class and global error handler middleware preventing raw database stack traces or internal secrets from leaking in production (`NODE_ENV === 'production'`).
+* **Input Sanitization & Custom Alias Validation:** Validates URL scheme (`http:` / `https:`) and enforces alphanumeric constraints (`^[a-zA-Z0-9_-]{3,30}$`) on custom aliases.
+
+---
+
+### 2. Unified Railway Deployment Architecture
+
+```
+                        Railway Single Container Deployment
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│   User Browser (https://url-shortener-production.up.railway.app)            │
+│                        │                                                    │
+│                        ▼                                                    │
+│               Express Server Container (Port 3000)                          │
+│             ┌───────────────────────────┐                                   │
+│             │  1. GET /         ──► Serves public/index.html UI             │
+│             │  2. POST /api/... ──► REST API & Shortener Logic              │
+│             │  3. GET /:code    ──► Cache-Aside Lookup & Redirect           │
+│             └───────────────────────────┘                                   │
+│                        │                                                    │
+│       ┌────────────────┴────────────────┐                                   │
+│       ▼                                 ▼                                   │
+│  Railway Postgres DB            Railway Redis DB                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+* **Single-Container Monolith:** Express serves both the static SPA (`public/index.html`) and backend API endpoints on the same origin, eliminating cross-origin CORS complexity.
+* **Automated Build & Migration Pipeline:** On deployment, `railway.json` triggers `npm run build` (`prisma generate && prisma db push`), auto-syncing database tables without manual migration steps.
+* **Graceful Shutdown:** Implements `SIGINT` / `SIGTERM` handlers to cleanly drain active requests, stop background workers, and disconnect Prisma & Redis client sockets.

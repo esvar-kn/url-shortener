@@ -13,6 +13,17 @@ model Url {
   longUrl    String   @map("long_url")
   createdAt  DateTime @default(now()) @map("created_at")
   clickCount Int      @default(0) @map("click_count")
+  clicks     Click[]
 
   @@map("urls")
+}
+
+model Click {
+  id        Int      @id @default(autoincrement())
+  urlId     Int      @map("url_id")
+  url       Url      @relation(fields: [urlId], references: [id], onDelete: Cascade)
+  clickedAt DateTime @default(now()) @map("clicked_at")
+
+  @@index([urlId])
+  @@map("clicks")
 }

@@ -4,8 +4,8 @@ const { redis } = require('../db/redis');
 let isRunning = false;
 
 /**
- * Worker process that consumes click tracking events from the Redis queue
- * and asynchronously persists click increments to Postgres DB.
+ * Worker process that consumes click tracking events from the Redis queue,
+ * increments total clickCount, and records timestamped Click entries in Postgres DB.
  */
 async function processClickEvents() {
   isRunning = true;
@@ -22,15 +22,32 @@ async function processClickEvents() {
       const res = await redis.brpop('click-events', 2);
       if (res && res[1]) {
         const payload = JSON.parse(res[1]);
-        const { shortCode } = payload;
+        const { shortCode, timestamp } = payload;
 
         if (shortCode) {
-          await prisma.url.update({
+          const urlRecord = await prisma.url.findUnique({
             where: { shortCode },
-            data: { clickCount: { increment: 1 } }
-          }).catch((err) => {
-            console.error(`Failed to update clickCount for shortCode ${shortCode}:`, err.message);
+            select: { id: true }
           });
+
+          if (urlRecord) {
+            const clickedAt = timestamp ? new Date(timestamp) : new Date();
+
+            await prisma.$transaction([
+              prisma.url.update({
+                where: { id: urlRecord.id },
+                data: { clickCount: { increment: 1 } }
+              }),
+              prisma.click.create({
+                data: {
+                  urlId: urlRecord.id,
+                  clickedAt
+                }
+              })
+            ]).catch((err) => {
+              console.error(`Failed to process click event for shortCode ${shortCode}:`, err.message);
+            });
+          }
         }
       }
     } catch (err) {
@@ -46,7 +63,6 @@ function stopWorker() {
   isRunning = false;
 }
 
-// Automatically start if launched directly from CLI
 if (require.main === module) {
   processClickEvents();
 }
