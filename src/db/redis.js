@@ -65,9 +65,23 @@ const safeRedisDel = async (key) => {
   }
 };
 
+/**
+ * Safely push an event payload to a Redis list queue
+ */
+const safeRedisLpush = async (queueName, value) => {
+  try {
+    if (redis.status === 'ready') {
+      await redis.lpush(queueName, value);
+    }
+  } catch (err) {
+    console.warn(`Redis LPUSH failed for queue ${queueName}:`, err.message);
+  }
+};
+
 module.exports = {
   redis,
   safeRedisGet,
   safeRedisSetEx,
-  safeRedisDel
+  safeRedisDel,
+  safeRedisLpush
 };

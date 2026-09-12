@@ -280,3 +280,45 @@ URL Shortener redirects are an ideal candidate for **Aggressive CDN Edge Caching
 > [!TIP]
 > **CDN vs. Origin Tradeoff:**  
 > Compared to dynamic pages (like a bank balance page), URL shortener redirect headers can include `Cache-Control: public, max-age=86400`. If a link's target URL is ever modified, CDN edge caches must be explicitly purged or wait for TTL expiration.
+
+---
+
+## 📩 Section 5: Asynchronous Click Analytics & Message Queue
+
+### 1. Fast Path vs. Async Worker Architecture
+
+```
+                                [Fast Path - Redirection]
+Client ----> GET /:shortCode ----> Express App ----> Return HTTP 302 Redirect
+                                       |
+                               (LPUSH Payload)
+                                       v
+                             [Redis Queue: click-events]
+                                       |
+                               (BRPOP Consume)
+                                       v
+                           [Async Analytics Worker]
+                                       |
+                                       v
+                              [Postgres DB / ClickHouse]
+```
+
+* **The Problem:** Performing synchronous database writes (`UPDATE urls SET click_count = click_count + 1 WHERE short_code = ?`) on every redirect request adds database write contention and degrades redirection latency.
+* **The Solution:** On the hot path, the request handler immediately pushes a lightweight click event to an in-memory queue (`safeRedisLpush('click-events', payload)`) and returns the HTTP `302` redirect without waiting.
+* **Background Consumer:** A separate worker process continuously consumes events via `BRPOP` and batch updates click analytics in the database asynchronously.
+
+---
+
+### 2. Message Queue Architecture: Redis List vs. Production Message Brokers
+
+| Feature / Metric | Redis List Queue (`LPUSH` / `BRPOP`) | Production Brokers (Kafka / RabbitMQ) |
+| :--- | :--- | :--- |
+| **Use Case** | Lightweight in-memory queue for moderate scale | Enterprise-grade distributed event streaming |
+| **Latency** | Sub-millisecond ($< 1\text{ ms}$) | Low latency ($< 5\text{ ms}$) |
+| **Dependencies** | Zero extra dependencies (reuses existing Redis instance) | Requires dedicated cluster (Kafka brokers / Zookeeper / KRaft) |
+| **Persistence / Replay** | Translucent / volatile (cleared once popped) | Permanent log retention with replay capability |
+| **Consumer Scaling** | Single/multiple worker polling (`BRPOP`) | Consumer Groups with automated partition rebalancing |
+
+> [!NOTE]
+> **Production Recommendation:**  
+> In enterprise production systems handling millions of events/sec, **Apache Kafka** or **RabbitMQ** is preferred for event replayability, multi-consumer fanout (e.g. real-time fraud detection, geolocation tracking, data warehouse ingestion), and backpressure protection. For this project's scale, a **Redis List queue** provides a zero-overhead, highly performant async substitute.

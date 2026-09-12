@@ -1,5 +1,5 @@
 const prisma = require('../db/prisma');
-const { safeRedisGet, safeRedisSetEx } = require('../db/redis');
+const { safeRedisGet, safeRedisSetEx, safeRedisLpush } = require('../db/redis');
 const { encodeBase62 } = require('../utils/base62');
 
 const CACHE_TTL = parseInt(process.env.CACHE_TTL_SECONDS, 10) || 86400; // 24 hours default
@@ -64,7 +64,7 @@ exports.createShortUrl = async (req, res) => {
 
 /**
  * GET /:shortCode
- * Redirects shortCode to longUrl using Redis Cache-Aside pattern
+ * Redirects shortCode to longUrl using Redis Cache-Aside pattern & async queue click tracking
  */
 exports.redirectUrl = async (req, res) => {
   try {
@@ -80,14 +80,11 @@ exports.redirectUrl = async (req, res) => {
     const cachedLongUrl = await safeRedisGet(cacheKey);
 
     if (cachedLongUrl) {
-      // Cache Hit: Return 302 redirect directly from Redis without hitting Postgres
+      // Cache Hit: Return 302 redirect directly from Redis
       res.setHeader('X-Cache', 'HIT');
-      
-      // Asynchronously increment click count in Postgres DB
-      prisma.url.update({
-        where: { shortCode },
-        data: { clickCount: { increment: 1 } }
-      }).catch((err) => console.error('Failed to increment click count on cache hit:', err.message));
+
+      // Fast Path: Push click tracking event payload to Redis async queue without blocking response
+      await safeRedisLpush('click-events', JSON.stringify({ shortCode, timestamp: Date.now() }));
 
       return res.redirect(302, cachedLongUrl);
     }
@@ -104,11 +101,8 @@ exports.redirectUrl = async (req, res) => {
     // Step 3: Populate Redis Cache with TTL (Cache-Aside)
     await safeRedisSetEx(cacheKey, CACHE_TTL, urlRecord.longUrl);
 
-    // Increment click count in Postgres DB
-    await prisma.url.update({
-      where: { id: urlRecord.id },
-      data: { clickCount: { increment: 1 } }
-    });
+    // Fast Path: Push click tracking event payload to Redis async queue
+    await safeRedisLpush('click-events', JSON.stringify({ shortCode, timestamp: Date.now() }));
 
     res.setHeader('X-Cache', 'MISS');
     return res.redirect(302, urlRecord.longUrl);
