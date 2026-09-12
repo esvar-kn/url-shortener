@@ -1,9 +1,11 @@
 const assert = require('assert');
 const request = require('supertest');
 const app = require('../src/app');
+const prisma = require('../src/db/prisma');
+const { safeRedisDel, safeRedisGet, redis } = require('../src/db/redis');
 
 async function runApiTests() {
-  console.log('🧪 Running Express API & Endpoint Integration Tests...\n');
+  console.log('🧪 Running Express API & Redis Cache-Aside Integration Tests...\n');
 
   // Test 1: GET /health
   const healthRes = await request(app).get('/health');
@@ -27,10 +29,59 @@ async function runApiTests() {
   assert.strictEqual(invalidUrlRes.status, 400, 'Invalid URL format should return 400');
   console.log('✅ POST /api/shorten validation (invalid URL) passed');
 
-  console.log('\n🎉 All API Integration Tests Passed Successfully!');
+  // Test 5: End-to-End Cache-Aside Redirect Test
+  console.log('\n🔄 Testing GET /:shortCode Redirect & Redis Cache-Aside...');
+
+  const testLongUrl = 'https://example.com/test-redirect-page';
+  
+  // 5a. Create short URL in DB
+  const createdRecord = await prisma.url.create({
+    data: {
+      longUrl: testLongUrl
+    }
+  });
+
+  const { encodeBase62 } = require('../src/utils/base62');
+  const testShortCode = encodeBase62(createdRecord.id);
+
+  await prisma.url.update({
+    where: { id: createdRecord.id },
+    data: { shortCode: testShortCode }
+  });
+
+  // Clear Redis key to simulate fresh Cache Miss
+  await safeRedisDel(`url:${testShortCode}`);
+
+  // 5b. First Request -> Cache MISS (Queries Postgres DB & populates Redis)
+  const firstReq = await request(app).get(`/${testShortCode}`);
+  assert.strictEqual(firstReq.status, 302, 'First redirect request should return 302 Found');
+  assert.strictEqual(firstReq.headers.location, testLongUrl, 'Redirect Location should match longUrl');
+  assert.strictEqual(firstReq.headers['x-cache'], 'MISS', 'First request should be a Cache MISS');
+  console.log('  1️⃣ First request: Cache MISS -> Fetched from DB & cached in Redis');
+
+  // Verify key is now populated in Redis
+  const cachedVal = await safeRedisGet(`url:${testShortCode}`);
+  assert.strictEqual(cachedVal, testLongUrl, 'Redis key should now store the longUrl');
+
+  // 5c. Second Request -> Cache HIT (Served directly from Redis)
+  const secondReq = await request(app).get(`/${testShortCode}`);
+  assert.strictEqual(secondReq.status, 302, 'Second redirect request should return 302 Found');
+  assert.strictEqual(secondReq.headers.location, testLongUrl, 'Redirect Location should match longUrl');
+  assert.strictEqual(secondReq.headers['x-cache'], 'HIT', 'Second request should be a Cache HIT');
+  console.log('  2️⃣ Second request: Cache HIT -> Served directly from Redis without hitting DB');
+
+  // Clean up test data
+  await prisma.url.delete({ where: { id: createdRecord.id } }).catch(() => {});
+  await safeRedisDel(`url:${testShortCode}`);
+
+  console.log('\n🎉 All API & Redis Cache-Aside Integration Tests Passed Successfully!');
+  
+  // Close connection handles so process exits cleanly
+  await prisma.$disconnect();
+  redis.disconnect();
 }
 
 runApiTests().catch((err) => {
-  console.error('❌ API Integration Test Failed:', err);
+  console.error('❌ API & Redis Integration Test Failed:', err);
   process.exit(1);
 });

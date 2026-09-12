@@ -236,3 +236,47 @@ Because the URL Shortener is heavily **read-heavy (100:1 Read-to-Write ratio)** 
 When write traffic or total data volume exceeds the limits of a single primary node ($> 3\text{ TB}$):
 * **Shard Key:** `shortCode` (or `shortURL`). Sharding by `shortCode` guarantees that every `GET /:shortCode` redirect request routes deterministically to a single database shard, avoiding expensive cross-shard queries.
 * **Sharding Algorithm:** **Consistent Hashing (Hash-Based)**. Using consistent hashing on `shortCode` ensures uniform data distribution across physical database nodes and minimizes key movement when scaling the cluster up or down.
+
+---
+
+## ⚡ Section 4: Caching & CDN Strategy
+
+### 1. Redis Cache-Aside Pattern
+For high-speed redirection (`GET /:shortCode`), the application implements the **Cache-Aside (Lazy Loading)** pattern:
+
+```
+Client ----> GET /:shortCode ----> Express App
+                                       |
+                         +-------------+-------------+
+                         |                           |
+                   (Cache Hit)                 (Cache Miss)
+                         v                           v
+                 Return 302 Redirect         Query Postgres DB
+                 (X-Cache: HIT)                      |
+                         ^             +-------------+-------------+
+                         |             |                           |
+                         |          (Found)                   (Not Found)
+                         |             v                           v
+                         +--- Populate Redis Cache        Return 404 Error
+                              (TTL = 24h) & Return 302
+                              (X-Cache: MISS)
+```
+
+**Implementation Details:**
+- **Cache Key Format:** `url:{shortCode}`
+- **TTL Strategy:** Default expiration set to `86,400 seconds` (24 hours). Hot links stay warm; unused codes expire automatically to save RAM.
+- **Resilient Fallback:** If Redis is down or unreachable, the application catches the error silently and falls open directly to Postgres without hanging user requests.
+
+---
+
+### 2. Edge Caching & CDN Strategy
+URL Shortener redirects are an ideal candidate for **Aggressive CDN Edge Caching** (e.g. Cloudflare, AWS CloudFront, Fastly):
+
+* **Why URL Shortening is Perfect for CDN Caching:**
+  - **Static / Immutable Mapping:** Short codes rarely change destination URLs once created.
+  - **Global Latency Reduction:** Serving HTTP `301/302` redirects directly from edge locations closest to the user drops redirection latency to $< 10\text{ ms}$ worldwide.
+  - **Origin Server Shield:** Bypasses application origin servers for popular links, absorbing massive viral traffic spikes.
+
+> [!TIP]
+> **CDN vs. Origin Tradeoff:**  
+> Compared to dynamic pages (like a bank balance page), URL shortener redirect headers can include `Cache-Control: public, max-age=86400`. If a link's target URL is ever modified, CDN edge caches must be explicitly purged or wait for TTL expiration.

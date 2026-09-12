@@ -1,9 +1,12 @@
 const prisma = require('../db/prisma');
+const { safeRedisGet, safeRedisSetEx } = require('../db/redis');
 const { encodeBase62 } = require('../utils/base62');
+
+const CACHE_TTL = parseInt(process.env.CACHE_TTL_SECONDS, 10) || 86400; // 24 hours default
 
 /**
  * POST /api/shorten
- * Creates a short URL mapping for a given long URL using Postgres + Prisma & Base62 encoding
+ * Shortens a long URL and pre-caches the mapping in Redis
  */
 exports.createShortUrl = async (req, res) => {
   try {
@@ -38,6 +41,9 @@ exports.createShortUrl = async (req, res) => {
       data: { shortCode }
     });
 
+    // 4. Pre-cache in Redis for fast immediate lookup
+    await safeRedisSetEx(`url:${shortCode}`, CACHE_TTL, trimmedUrl);
+
     const host = req.get('host');
     const protocol = req.protocol;
     const shortUrl = `${protocol}://${host}/${shortCode}`;
@@ -52,6 +58,62 @@ exports.createShortUrl = async (req, res) => {
     });
   } catch (error) {
     console.error('Error creating short URL:', error);
+    return res.status(500).json({ error: 'Internal Server Error' });
+  }
+};
+
+/**
+ * GET /:shortCode
+ * Redirects shortCode to longUrl using Redis Cache-Aside pattern
+ */
+exports.redirectUrl = async (req, res) => {
+  try {
+    const { shortCode } = req.params;
+
+    if (!shortCode) {
+      return res.status(400).json({ error: 'shortCode is required' });
+    }
+
+    const cacheKey = `url:${shortCode}`;
+
+    // Step 1: Redis Cache Lookup (Cache-Aside)
+    const cachedLongUrl = await safeRedisGet(cacheKey);
+
+    if (cachedLongUrl) {
+      // Cache Hit: Return 302 redirect directly from Redis without hitting Postgres
+      res.setHeader('X-Cache', 'HIT');
+      
+      // Asynchronously increment click count in Postgres DB
+      prisma.url.update({
+        where: { shortCode },
+        data: { clickCount: { increment: 1 } }
+      }).catch((err) => console.error('Failed to increment click count on cache hit:', err.message));
+
+      return res.redirect(302, cachedLongUrl);
+    }
+
+    // Step 2: Cache Miss -> Query Postgres DB
+    const urlRecord = await prisma.url.findUnique({
+      where: { shortCode }
+    });
+
+    if (!urlRecord) {
+      return res.status(404).json({ error: 'Short URL not found' });
+    }
+
+    // Step 3: Populate Redis Cache with TTL (Cache-Aside)
+    await safeRedisSetEx(cacheKey, CACHE_TTL, urlRecord.longUrl);
+
+    // Increment click count in Postgres DB
+    await prisma.url.update({
+      where: { id: urlRecord.id },
+      data: { clickCount: { increment: 1 } }
+    });
+
+    res.setHeader('X-Cache', 'MISS');
+    return res.redirect(302, urlRecord.longUrl);
+  } catch (error) {
+    console.error('Error handling redirect:', error);
     return res.status(500).json({ error: 'Internal Server Error' });
   }
 };
